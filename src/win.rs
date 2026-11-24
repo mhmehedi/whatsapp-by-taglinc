@@ -11,17 +11,19 @@ use tao::{
     platform::windows::{EventLoopBuilderExtWindows, IconExtWindows, WindowExtWindows},
     window::{Icon, Window, WindowBuilder},
 };
-use windows_sys::Win32::UI::{
-    Shell::{SetCurrentProcessExplicitAppUserModelID, ShellExecuteW},
-    WindowsAndMessaging::{MessageBoxW, TranslateAcceleratorW, MB_ICONWARNING, MB_OK, MSG, SW_SHOWNORMAL},
+use windows_sys::Win32::{
+    System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ},
+    UI::{
+        Shell::ShellExecuteW,
+        WindowsAndMessaging::{MessageBoxW, TranslateAcceleratorW, MB_ICONWARNING, MB_OK, MSG, SW_SHOWNORMAL},
+    },
 };
 use wry::{WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows};
 
 pub const CMD: Modifiers = Modifiers::CONTROL;
 pub const SIDEBAR_INIT: &str = "window.MOD='Ctrl+';";
 
-/// Must match the AppUserModelID the installer puts on the Start menu shortcut, or Windows
-/// won't show the app's toasts.
+/// Toast sender id, registered under HKCU\Software\Classes\AppUserModelId at start-up.
 const APP_ID: &str = "TagLinc.WhatsappByTagLinc";
 /// Profile folders of removed accounts that were still in use; deleted on next start.
 const PENDING: &str = "pending-delete.txt";
@@ -69,9 +71,7 @@ pub fn check_runtime() -> Result<(), String> {
 }
 
 pub fn before_start(dir: &Path) {
-    unsafe {
-        SetCurrentProcessExplicitAppUserModelID(wide(APP_ID).as_ptr());
-    }
+    register_toast_sender();
     // Finish deleting removed accounts whose files were locked last time.
     let list = dir.join(PENDING);
     if let Ok(s) = fs::read_to_string(&list) {
@@ -81,6 +81,22 @@ pub fn before_start(dir: &Path) {
             .filter(|id| profile_dir(dir, id).exists())
             .collect();
         let _ = if left.is_empty() { fs::remove_file(&list) } else { fs::write(&list, left.join("\n")) };
+    }
+}
+
+/// Windows only shows toasts from an app id it knows; register ours with a display name.
+fn register_toast_sender() {
+    let key = wide(&format!("Software\\Classes\\AppUserModelId\\{APP_ID}"));
+    let (name, value) = (wide("DisplayName"), wide(APP_NAME));
+    unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            REG_SZ,
+            value.as_ptr().cast(),
+            (value.len() * 2) as u32,
+        );
     }
 }
 

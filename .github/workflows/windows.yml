@@ -38,10 +38,10 @@ jobs:
       - name: Installer
         shell: pwsh
         run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+          $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $nsis)) { choco install nsis -y --no-progress; }
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
-          & $iscc "/DAppVersion=$version" installer\windows.iss
+          & $nsis "/DAPP_VERSION=$version" installer\windows.nsi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-Item dist\Whatsapp-by-TagLinc-Setup.exe | Select-Object Name, Length
 

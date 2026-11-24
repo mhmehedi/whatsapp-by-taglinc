@@ -71,7 +71,7 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
 The universal app and DMG are written to `dist/`.
 
-The Windows installer is built by GitHub Actions ([`.github/workflows/windows.yml`](.github/workflows/windows.yml)) with [Inno Setup](https://jrsoftware.org/isinfo.php) and attached to each release. To build it on a Windows PC: `cargo build --release --target x86_64-pc-windows-msvc`, then `iscc installer\windows.iss`.
+The Windows installer is built by GitHub Actions ([`.github/workflows/windows.yml`](.github/workflows/windows.yml)) with [NSIS](https://nsis.sourceforge.io) and attached to each release. To build it on a Windows PC: `cargo build --release --target x86_64-pc-windows-msvc`, then `makensis installer\windows.nsi`.
 
 ## License
 
