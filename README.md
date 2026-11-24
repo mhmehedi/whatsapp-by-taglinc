@@ -60,6 +60,12 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
 The universal app and DMG are written to `dist/`.
 
+## License
+
+The source code is released under the [MIT License](LICENSE).
+
+The MIT License does not cover the logos and icons in this repository: the WhatsApp icon (`assets/AppIcon.icns`, `assets/DmgIcon.icns`) belongs to Meta Platforms, Inc., and the FlyNode, TagLinc, Doze Host and Hyperlink logos (`marketing/brand/`) belong to their owners.
+
 ## Disclaimer
 
 This project is not affiliated with, endorsed by, or sponsored by WhatsApp or Meta Platforms, Inc. WhatsApp is a trademark of Meta Platforms, Inc. The app only displays the official WhatsApp Web site.
