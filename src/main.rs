@@ -8,7 +8,7 @@ use muda::{
     Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
 };
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Read, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf, process::Command};
 use tao::{
     dpi::{LogicalPosition, LogicalSize},
     event::{Event, WindowEvent},
@@ -77,10 +77,15 @@ fn save_accounts(slots: &[Slot]) {
 
 fn new_id() -> String {
     let mut b = [0u8; 16];
-    if let Ok(mut f) = fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut b);
-    }
+    getrandom::fill(&mut b).expect("OS random number generator unavailable");
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Links clicked in WhatsApp go to the default browser/mail/phone app. Anything else
+/// (file://, app-specific schemes, ...) is ignored so a chat message can't launch local files.
+fn is_safe_external_url(url: &str) -> bool {
+    let lower = url.trim_start().to_ascii_lowercase();
+    ["http://", "https://", "mailto:", "tel:"].iter().any(|p| lower.starts_with(p))
 }
 
 fn id_bytes(id: &str) -> [u8; 16] {
@@ -167,7 +172,9 @@ fn build_wa_view(window: &Window, acc: &Account, proxy: &EventLoopProxy<UserEven
         })
         .with_new_window_req_handler(|url, _| {
             // External links (and "open in new tab") go to the default browser.
-            let _ = Command::new("open").arg(url).spawn();
+            if is_safe_external_url(&url) {
+                let _ = Command::new("/usr/bin/open").arg(url.trim_start()).spawn();
+            }
             NewWindowResponse::Deny
         })
         .build_as_child(window)
@@ -505,4 +512,32 @@ fn main() {
             _ => {}
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_safe_external_url, new_id};
+
+    #[test]
+    fn allows_web_mail_and_phone_links() {
+        for u in ["https://example.com", "http://x.y/a?b=c", "HTTPS://EXAMPLE.COM", "mailto:a@b.c", "tel:+8801"] {
+            assert!(is_safe_external_url(u), "{u}");
+        }
+    }
+
+    #[test]
+    fn rejects_local_and_other_schemes() {
+        for u in ["file:///Applications/Calculator.app", "-a Calculator", "javascript:alert(1)",
+                  "x-apple.systempreferences:", "smb://host/share", "", "ftp://x"] {
+            assert!(!is_safe_external_url(u), "{u}");
+        }
+    }
+
+    #[test]
+    fn ids_are_random_hex() {
+        let (a, b) = (new_id(), new_id());
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
 }

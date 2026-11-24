@@ -17,7 +17,7 @@ use objc2::{
 use objc2_foundation::{NSBundle, NSData};
 use std::{
     fs,
-    io::{Read, Write},
+    io::Write,
     os::unix::fs::OpenOptionsExt,
     path::Path,
     process::Command,
@@ -76,9 +76,8 @@ fn migrate_from_keychain() -> Option<Vec<u8>> {
 
 fn random_key() -> Vec<u8> {
     let mut b = vec![0u8; 16];
-    if let Ok(mut f) = fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut b);
-    }
+    // Never fall back to a predictable key: abort if the OS RNG is unavailable.
+    getrandom::fill(&mut b).expect("OS random number generator unavailable");
     b
 }
 
