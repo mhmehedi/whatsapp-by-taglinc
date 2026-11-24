@@ -5,10 +5,15 @@ mod webcrypto;
 
 use muda::{
     accelerator::{Accelerator, Code, Modifiers},
-    Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
+    CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
 };
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::PathBuf,
+    process::Command,
+    time::{Duration, Instant},
+};
 use tao::{
     dpi::{LogicalPosition, LogicalSize},
     event::{Event, WindowEvent},
@@ -17,6 +22,7 @@ use tao::{
 };
 use wry::{
     NewWindowResponse, Rect, WebView, WebViewBuilder, WebViewBuilderExtDarwin, WebViewExtDarwin,
+    WebViewExtMacOS,
 };
 
 const SIDEBAR_W: f64 = 64.0;
@@ -25,10 +31,31 @@ const WA_URL: &str = "https://web.whatsapp.com/";
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
                   (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 
+// Memory saving. WhatsApp Web keeps growing while it runs (chats, media); a reload brings an
+// account back to ~350 MB. Accounts marked "sleep" are closed entirely after a while unused.
+const RELOAD_ABOVE_MB: u64 = 700;
+// Some accounts (big chat histories) need 1 GB+ right after loading; only reload when an
+// account has grown this much past its own fresh-load size, so a reload actually helps.
+const RELOAD_GROWTH_MB: u64 = 400;
+const SETTLE: Duration = Duration::from_secs(2 * 60);
+const MIN_RELOAD_GAP: Duration = Duration::from_secs(15 * 60);
+const IDLE_BEFORE_RELOAD_ACTIVE: Duration = Duration::from_secs(10 * 60);
+const SLEEP_AFTER: Duration = Duration::from_secs(30 * 60);
+const CHECK_EVERY: Duration = Duration::from_secs(60);
+
+/// Test overrides: MWA_RELOAD_MB, MWA_RELOAD_GROWTH_MB, MWA_RELOAD_GAP_SECS, MWA_SLEEP_SECS, MWA_TICK_SECS, MWA_START.
+fn env_num(key: &str) -> Option<u64> {
+    std::env::var(key).ok()?.parse().ok()
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct Account {
     id: String, // 32 hex chars = 16-byte data store identifier
     name: String,
+    /// Close this account's WhatsApp when it hasn't been used for a while (saves memory,
+    /// but it gets no notifications while asleep).
+    #[serde(default)]
+    sleep: bool,
 }
 
 #[derive(Debug)]
@@ -39,12 +66,68 @@ enum UserEvent {
     Notify(String, String, String),
     Rename(String, String),
     Remove(String),
+    Tick,
 }
 
 struct Slot {
     acc: Account,
-    view: WebView,
+    view: Option<WebView>, // None while asleep
     unread: u32,
+    last_used: Instant,
+    last_reload: Instant,
+    /// Smallest memory use seen since the last (re)load, once the page settled.
+    baseline_mb: Option<u64>,
+}
+
+impl Slot {
+    fn new(acc: Account, view: Option<WebView>) -> Self {
+        let now = Instant::now();
+        Slot { acc, view, unread: 0, last_used: now, last_reload: now, baseline_mb: None }
+    }
+}
+
+/// Process id of the WebKit content process that runs this webview's page.
+fn web_pid(view: &WebView) -> Option<i32> {
+    use objc2::{msg_send, sel};
+    let wk = view.webview();
+    let pid: i32 = unsafe {
+        let ok: bool = msg_send![&*wk, respondsToSelector: sel!(_webProcessIdentifier)];
+        if !ok {
+            return None;
+        }
+        msg_send![&*wk, _webProcessIdentifier]
+    };
+    (pid > 0).then_some(pid)
+}
+
+/// Fully closes a webview's page so WebKit frees its memory. Dropping the WebView alone
+/// leaves the page (and ~100+ MB) alive in WebKit's content process.
+fn close_page(view: &WebView) {
+    use objc2::{msg_send, sel};
+    let wk = view.webview();
+    unsafe {
+        let ok: bool = msg_send![&*wk, respondsToSelector: sel!(_close)];
+        if ok {
+            let _: () = msg_send![&*wk, _close];
+        } else {
+            let _ = view.load_url("about:blank");
+        }
+    }
+}
+
+/// Physical memory (MB) of the WebKit process behind a webview, as Activity Monitor shows it.
+fn footprint_mb(view: &WebView) -> Option<u64> {
+    unsafe extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
+    }
+    let pid = web_pid(view)?;
+    // rusage_info_v2: uuid (2 words), then user/system time, wakeups x2, pageins,
+    // wired, resident, phys_footprint (word 9).
+    let mut buf = [0u64; 64];
+    if unsafe { proc_pid_rusage(pid, 2, buf.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    Some(buf[9] / (1024 * 1024))
 }
 
 // ---------- persistence ----------
@@ -142,13 +225,17 @@ const NOTIFY_SHIM: &str = r#"
 })();
 "#;
 
+fn wa_url() -> String {
+    std::env::var("MWA_URL").unwrap_or_else(|_| WA_URL.into()) // test override
+}
+
 fn build_wa_view(window: &Window, acc: &Account, proxy: &EventLoopProxy<UserEvent>) -> WebView {
     let (p1, p2) = (proxy.clone(), proxy.clone());
     let (id1, id2) = (acc.id.clone(), acc.id.clone());
     WebViewBuilder::new()
         .with_data_store_identifier(id_bytes(&acc.id))
         .with_user_agent(UA)
-        .with_url(std::env::var("MWA_URL").unwrap_or_else(|_| WA_URL.into())) // test override
+        .with_url(wa_url())
         .with_bounds(wa_bounds(window))
         .with_visible(false)
         .with_initialization_script(NOTIFY_SHIM)
@@ -190,12 +277,13 @@ html,body{margin:0;height:100%;background:var(--bg);font:600 15px -apple-system,
 .a.on{border-color:var(--act)}
 .a .b{position:absolute;top:-6px;right:-6px;min-width:18px;height:18px;padding:0 4px;box-sizing:border-box;border-radius:9px;background:#e53935;color:#fff;font-size:11px;display:flex;align-items:center;justify-content:center}
 .add{color:var(--act);font-size:26px;font-weight:400}
+.a.z{opacity:.45}.a.z:after{content:'z';position:absolute;right:3px;bottom:0;font-size:10px;opacity:.8}
 </style></head><body><div id="l"></div><script>
 const send=m=>window.ipc.postMessage(m);
 window.render=function(list){
   const l=document.getElementById('l');l.innerHTML='';
-  list.forEach((a,i)=>{const d=document.createElement('div');d.className='a'+(a.active?' on':'');
-    d.title=a.name+'  (⌘'+(i+1)+')  — right-click to rename/remove';
+  list.forEach((a,i)=>{const d=document.createElement('div');d.className='a'+(a.active?' on':'')+(a.asleep?' z':'');
+    d.title=a.name+'  (⌘'+(i+1)+')'+(a.asleep?'  — asleep, click to open':'')+'  — right-click to rename/remove';
     d.textContent=(a.name.trim()[0]||'?').toUpperCase();
     if(a.unread>0){const b=document.createElement('span');b.className='b';b.textContent=a.unread>99?'99+':a.unread;d.appendChild(b);}
     d.onclick=()=>send('select:'+a.id);
@@ -213,6 +301,9 @@ struct App {
     slots: Vec<Slot>,
     active: usize,
     proxy: EventLoopProxy<UserEvent>,
+    sleep_item: CheckMenuItem,
+    /// When the window last lost focus (None while it's in front).
+    away_since: Option<Instant>,
 }
 
 impl App {
@@ -222,7 +313,8 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                serde_json::json!({"id": s.acc.id, "name": s.acc.name, "unread": s.unread, "active": i == self.active})
+                serde_json::json!({"id": s.acc.id, "name": s.acc.name, "unread": s.unread,
+                                   "active": i == self.active, "asleep": s.view.is_none()})
             })
             .collect();
         let _ = self.sidebar.evaluate_script(&format!(
@@ -242,18 +334,101 @@ impl App {
         if idx >= self.slots.len() {
             return;
         }
-        self.active = idx;
-        for (i, s) in self.slots.iter().enumerate() {
-            let _ = s.view.set_visible(i == idx);
+        if let Some(prev) = self.slots.get_mut(self.active) {
+            prev.last_used = Instant::now();
         }
-        let _ = self.slots[idx].view.focus();
+        self.active = idx;
+        self.wake(idx);
+        for (i, s) in self.slots.iter().enumerate() {
+            if let Some(v) = &s.view {
+                let _ = v.set_visible(i == idx);
+            }
+        }
+        if let Some(v) = &self.slots[idx].view {
+            let _ = v.focus();
+        }
+        self.slots[idx].last_used = Instant::now();
+        self.sync_sleep_check();
         self.refresh_sidebar();
     }
 
+    fn wake(&mut self, i: usize) {
+        if self.slots[i].view.is_none() {
+            if std::env::var_os("MWA_DEBUG").is_some() {
+                eprintln!("MWA_DEBUG: wake {} (active {})", self.slots[i].acc.name, self.active);
+            }
+            let view = build_wa_view(&self.window, &self.slots[i].acc, &self.proxy);
+            let s = &mut self.slots[i];
+            s.view = Some(view);
+            s.last_reload = Instant::now();
+            s.baseline_mb = None;
+        }
+    }
+
+    fn sync_sleep_check(&self) {
+        let on = self.slots.get(self.active).is_some_and(|s| s.acc.sleep);
+        self.sleep_item.set_checked(on);
+    }
+
+    fn toggle_sleep(&mut self) {
+        let Some(s) = self.slots.get_mut(self.active) else { return };
+        s.acc.sleep = !s.acc.sleep;
+        save_accounts(&self.slots);
+        self.sync_sleep_check();
+    }
+
+    /// Runs every minute: put idle "sleep" accounts to sleep, reload accounts that grew too big.
+    fn tick(&mut self) {
+        let debug = std::env::var_os("MWA_DEBUG").is_some();
+        let limit = env_num("MWA_RELOAD_MB").unwrap_or(RELOAD_ABOVE_MB);
+        let sleep_after = env_num("MWA_SLEEP_SECS").map(Duration::from_secs).unwrap_or(SLEEP_AFTER);
+        let growth = env_num("MWA_RELOAD_GROWTH_MB").unwrap_or(RELOAD_GROWTH_MB);
+        let gap = env_num("MWA_RELOAD_GAP_SECS").map(Duration::from_secs).unwrap_or(MIN_RELOAD_GAP);
+        let away = self.away_since.is_some_and(|t| t.elapsed() >= IDLE_BEFORE_RELOAD_ACTIVE);
+        let mut changed = false;
+        for (i, s) in self.slots.iter_mut().enumerate() {
+            let Some(view) = &s.view else { continue };
+            let active = i == self.active;
+            if !active && s.acc.sleep && s.last_used.elapsed() >= sleep_after {
+                if debug {
+                    eprintln!("MWA_DEBUG: sleep {}", s.acc.name);
+                }
+                if let Some(v) = s.view.take() {
+                    close_page(&v);
+                }
+                s.unread = 0;
+                changed = true;
+                continue;
+            }
+            let mb = footprint_mb(view);
+            if debug {
+                eprintln!("MWA_DEBUG: {} uses {:?} MB (pid {:?}, baseline {:?})", s.acc.name, mb, web_pid(view), s.baseline_mb);
+            }
+            // The visible account is only reloaded once you've been away from the app a while.
+            let idle = !active || away;
+            let Some(mb) = mb else { continue };
+            if s.last_reload.elapsed() >= SETTLE.min(gap) {
+                s.baseline_mb = Some(s.baseline_mb.map_or(mb, |b| b.min(mb)));
+            }
+            let grown = s.baseline_mb.is_some_and(|b| mb >= b + growth);
+            if mb > limit && grown && idle && s.last_reload.elapsed() >= gap {
+                if debug {
+                    eprintln!("MWA_DEBUG: reload {} ({:?} MB)", s.acc.name, mb);
+                }
+                let _ = view.load_url(&wa_url());
+                s.last_reload = Instant::now();
+                s.baseline_mb = None;
+            }
+        }
+        if changed {
+            self.refresh_sidebar();
+        }
+    }
+
     fn add(&mut self) {
-        let acc = Account { id: new_id(), name: format!("Account {}", self.slots.len() + 1) };
+        let acc = Account { id: new_id(), name: format!("Account {}", self.slots.len() + 1), sleep: false };
         let view = build_wa_view(&self.window, &acc, &self.proxy);
-        self.slots.push(Slot { acc, view, unread: 0 });
+        self.slots.push(Slot::new(acc, Some(view)));
         save_accounts(&self.slots);
         self.select(self.slots.len() - 1);
     }
@@ -296,26 +471,31 @@ impl App {
         let Some(i) = self.index_of(id) else { return };
         let slot = self.slots.remove(i);
         let bytes = id_bytes(&slot.acc.id);
+        if let Some(v) = &slot.view {
+            close_page(v);
+        }
         drop(slot.view); // must drop before removing the data store
         WebView::remove_data_store(&bytes, |_| {});
         save_accounts(&self.slots);
         if self.slots.is_empty() {
             self.add();
         } else {
-            self.select(self.active.min(self.slots.len() - 1));
+            // the removed account must not count as "previously active"
+            self.active = self.active.min(self.slots.len() - 1);
+            self.select(self.active);
         }
     }
 
     fn layout(&self) {
         let _ = self.sidebar.set_bounds(sidebar_bounds(&self.window));
         let b = wa_bounds(&self.window);
-        for s in &self.slots {
-            let _ = s.view.set_bounds(b);
+        for v in self.slots.iter().filter_map(|s| s.view.as_ref()) {
+            let _ = v.set_bounds(b);
         }
     }
 }
 
-fn build_menu() -> (Menu, MenuItem, MenuItem, MenuItem, Vec<MenuItem>) {
+fn build_menu() -> (Menu, MenuItem, MenuItem, MenuItem, CheckMenuItem, Vec<MenuItem>) {
     let menu = Menu::new();
     let app_m = Submenu::new(APP_NAME, true);
     let _ = app_m.append_items(&[
@@ -341,6 +521,7 @@ fn build_menu() -> (Menu, MenuItem, MenuItem, MenuItem, Vec<MenuItem>) {
     let add = MenuItem::new("New Account", true, Some(Accelerator::new(cmd, Code::KeyN)));
     let reload = MenuItem::new("Reload", true, Some(Accelerator::new(cmd, Code::KeyR)));
     let rename = MenuItem::new("Rename / Remove…", true, None);
+    let sleep = CheckMenuItem::new("Sleep When Not Used (saves memory, no notifications)", true, false, None);
     let digits = [
         Code::Digit1, Code::Digit2, Code::Digit3, Code::Digit4, Code::Digit5,
         Code::Digit6, Code::Digit7, Code::Digit8, Code::Digit9,
@@ -351,7 +532,7 @@ fn build_menu() -> (Menu, MenuItem, MenuItem, MenuItem, Vec<MenuItem>) {
         .map(|(i, c)| MenuItem::new(format!("Account {}", i + 1), true, Some(Accelerator::new(cmd, *c))))
         .collect();
     let acc_m = Submenu::new("Account", true);
-    let _ = acc_m.append_items(&[&add, &reload, &rename, &PredefinedMenuItem::separator()]);
+    let _ = acc_m.append_items(&[&add, &reload, &rename, &sleep, &PredefinedMenuItem::separator()]);
     for s in &switch {
         let _ = acc_m.append(s);
     }
@@ -362,7 +543,7 @@ fn build_menu() -> (Menu, MenuItem, MenuItem, MenuItem, Vec<MenuItem>) {
         &PredefinedMenuItem::close_window(None),
     ]);
     let _ = menu.append_items(&[&app_m, &edit_m, &acc_m, &win_m]);
-    (menu, add, reload, rename, switch)
+    (menu, add, reload, rename, sleep, switch)
 }
 
 fn main() {
@@ -381,7 +562,7 @@ fn main() {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    let (menu, m_add, m_reload, m_edit, m_switch) = build_menu();
+    let (menu, m_add, m_reload, m_edit, m_sleep, m_switch) = build_menu();
     menu.init_for_nsapp();
     {
         let p = proxy.clone();
@@ -417,19 +598,33 @@ fn main() {
 
     let mut accounts = load_accounts();
     if accounts.is_empty() {
-        accounts.push(Account { id: new_id(), name: "Account 1".into() });
+        accounts.push(Account { id: new_id(), name: "Account 1".into(), sleep: false });
     }
+    // "Sleep" accounts start asleep (except the first, which is shown) and wake on click.
     let slots: Vec<Slot> = accounts
         .into_iter()
-        .map(|acc| {
-            let view = build_wa_view(&window, &acc, &proxy);
-            Slot { acc, view, unread: 0 }
+        .enumerate()
+        .map(|(i, acc)| {
+            let view = (i == 0 || !acc.sleep).then(|| build_wa_view(&window, &acc, &proxy));
+            Slot::new(acc, view)
         })
         .collect();
 
-    let mut app = App { window, sidebar, slots, active: 0, proxy };
+    {
+        let p = proxy.clone();
+        let every = env_num("MWA_TICK_SECS").map(Duration::from_secs).unwrap_or(CHECK_EVERY);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(every);
+            if p.send_event(UserEvent::Tick).is_err() {
+                break;
+            }
+        });
+    }
+
+    let mut app = App { window, sidebar, slots, active: 0, proxy, sleep_item: m_sleep.clone(), away_since: None };
     save_accounts(&app.slots);
-    app.select(0);
+    let start = env_num("MWA_START").unwrap_or(0) as usize;
+    app.select(if start < app.slots.len() { start } else { 0 });
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -439,6 +634,9 @@ fn main() {
             }
             Event::WindowEvent { event: WindowEvent::Resized(_), .. }
             | Event::WindowEvent { event: WindowEvent::ScaleFactorChanged { .. }, .. } => app.layout(),
+            Event::WindowEvent { event: WindowEvent::Focused(f), .. } => {
+                app.away_since = if f { None } else { Some(Instant::now()) };
+            }
             Event::UserEvent(ev) => match ev {
                 UserEvent::Sidebar(msg) => {
                     if msg == "ready" {
@@ -457,9 +655,15 @@ fn main() {
                     if e.id == *m_add.id() {
                         app.add();
                     } else if e.id == *m_reload.id() {
-                        if let Some(s) = app.slots.get(app.active) {
-                            let _ = s.view.load_url(WA_URL);
+                        if let Some(s) = app.slots.get_mut(app.active) {
+                            if let Some(v) = &s.view {
+                                let _ = v.load_url(&wa_url());
+                            }
+                            s.last_reload = Instant::now();
+                            s.baseline_mb = None;
                         }
+                    } else if e.id == *m_sleep.id() {
+                        app.toggle_sleep();
                     } else if e.id == *m_edit.id() {
                         if let Some(s) = app.slots.get(app.active) {
                             app.edit(&s.acc.id.clone());
@@ -508,6 +712,7 @@ fn main() {
                     }
                 }
                 UserEvent::Remove(id) => app.remove(&id),
+                UserEvent::Tick => app.tick(),
             },
             _ => {}
         }
