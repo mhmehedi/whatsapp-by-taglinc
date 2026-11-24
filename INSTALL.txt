@@ -32,7 +32,7 @@ Memory
   An account that keeps growing (past 700 MB and 400 MB above its size when
   it opened) is reloaded automatically while you're not looking at it.
   It stays logged in.
-  Account -> Sleep When Not Used: closes that account after 30 minutes unused,
+  Account -> Sleep When Not Used: closes that account after 15 minutes unused,
   so it uses no memory. Click it to open it again. A sleeping account gets no
   notifications.
 

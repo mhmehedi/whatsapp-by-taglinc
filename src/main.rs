@@ -40,7 +40,7 @@ const RELOAD_GROWTH_MB: u64 = 400;
 const SETTLE: Duration = Duration::from_secs(2 * 60);
 const MIN_RELOAD_GAP: Duration = Duration::from_secs(15 * 60);
 const IDLE_BEFORE_RELOAD_ACTIVE: Duration = Duration::from_secs(10 * 60);
-const SLEEP_AFTER: Duration = Duration::from_secs(30 * 60);
+const SLEEP_AFTER: Duration = Duration::from_secs(15 * 60);
 const CHECK_EVERY: Duration = Duration::from_secs(60);
 
 /// Test overrides: MWA_RELOAD_MB, MWA_RELOAD_GROWTH_MB, MWA_RELOAD_GAP_SECS, MWA_SLEEP_SECS, MWA_TICK_SECS, MWA_START.
