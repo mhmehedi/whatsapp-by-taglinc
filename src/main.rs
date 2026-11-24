@@ -1,17 +1,25 @@
-// Whatsapp by TagLinc — a tiny macOS app that hosts several isolated WhatsApp Web sessions.
-// Each account gets its own WKWebsiteDataStore (macOS 14+), so logins never mix.
+// Whatsapp by TagLinc — a tiny app that hosts several isolated WhatsApp Web sessions.
+// macOS: each account gets its own WKWebsiteDataStore (macOS 14+).
+// Windows: each account gets its own WebView2 profile.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(target_os = "macos")]
+#[path = "mac.rs"]
+mod platform;
+#[cfg(target_os = "macos")]
 mod webcrypto;
+#[cfg(windows)]
+#[path = "win.rs"]
+mod platform;
 
 use muda::{
-    accelerator::{Accelerator, Code, Modifiers},
+    accelerator::{Accelerator, Code},
     CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::PathBuf,
-    process::Command,
     time::{Duration, Instant},
 };
 use tao::{
@@ -20,16 +28,11 @@ use tao::{
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     window::{Window, WindowBuilder},
 };
-use wry::{
-    NewWindowResponse, Rect, WebView, WebViewBuilder, WebViewBuilderExtDarwin, WebViewExtDarwin,
-    WebViewExtMacOS,
-};
+use wry::{NewWindowResponse, Rect, WebContext, WebView, WebViewBuilder};
 
 const SIDEBAR_W: f64 = 64.0;
 const APP_NAME: &str = "Whatsapp by TagLinc";
 const WA_URL: &str = "https://web.whatsapp.com/";
-const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
-                  (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 
 // Memory saving. WhatsApp Web keeps growing while it runs (chats, media); a reload brings an
 // account back to ~350 MB. Accounts marked "sleep" are closed entirely after a while unused.
@@ -65,6 +68,7 @@ enum UserEvent {
     Title(String, String),
     Notify(String, String, String),
     Rename(String, String),
+    #[cfg_attr(windows, allow(dead_code))] // Windows removes via the sidebar
     Remove(String),
     Tick,
 }
@@ -86,59 +90,12 @@ impl Slot {
     }
 }
 
-/// Process id of the WebKit content process that runs this webview's page.
-fn web_pid(view: &WebView) -> Option<i32> {
-    use objc2::{msg_send, sel};
-    let wk = view.webview();
-    let pid: i32 = unsafe {
-        let ok: bool = msg_send![&*wk, respondsToSelector: sel!(_webProcessIdentifier)];
-        if !ok {
-            return None;
-        }
-        msg_send![&*wk, _webProcessIdentifier]
-    };
-    (pid > 0).then_some(pid)
-}
-
-/// Fully closes a webview's page so WebKit frees its memory. Dropping the WebView alone
-/// leaves the page (and ~100+ MB) alive in WebKit's content process.
-fn close_page(view: &WebView) {
-    use objc2::{msg_send, sel};
-    let wk = view.webview();
-    unsafe {
-        let ok: bool = msg_send![&*wk, respondsToSelector: sel!(_close)];
-        if ok {
-            let _: () = msg_send![&*wk, _close];
-        } else {
-            let _ = view.load_url("about:blank");
-        }
-    }
-}
-
-/// Physical memory (MB) of the WebKit process behind a webview, as Activity Monitor shows it.
-fn footprint_mb(view: &WebView) -> Option<u64> {
-    unsafe extern "C" {
-        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
-    }
-    let pid = web_pid(view)?;
-    // rusage_info_v2: uuid (2 words), then user/system time, wakeups x2, pageins,
-    // wired, resident, phys_footprint (word 9).
-    let mut buf = [0u64; 64];
-    if unsafe { proc_pid_rusage(pid, 2, buf.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    Some(buf[9] / (1024 * 1024))
-}
-
 // ---------- persistence ----------
 
 fn data_dir() -> PathBuf {
     let p = match std::env::var_os("MWA_DATA_DIR") {
         Some(d) => PathBuf::from(d), // test override
-        None => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join("Library/Application Support/MultiWhatsApp")
-        }
+        None => platform::default_data_dir(),
     };
     let _ = fs::create_dir_all(&p);
     p
@@ -171,24 +128,7 @@ fn is_safe_external_url(url: &str) -> bool {
     ["http://", "https://", "mailto:", "tel:"].iter().any(|p| lower.starts_with(p))
 }
 
-fn id_bytes(id: &str) -> [u8; 16] {
-    let mut b = [0u8; 16];
-    for (i, byte) in b.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(id.get(i * 2..i * 2 + 2).unwrap_or("00"), 16).unwrap_or(0);
-    }
-    b
-}
-
 // ---------- helpers ----------
-
-fn osascript(script: &str) -> Option<String> {
-    let out = Command::new("osascript").arg("-e").arg(script).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-fn as_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-}
 
 fn content_rect(window: &Window) -> (f64, f64) {
     let size: LogicalSize<f64> = window.inner_size().to_logical(window.scale_factor());
@@ -229,12 +169,15 @@ fn wa_url() -> String {
     std::env::var("MWA_URL").unwrap_or_else(|_| WA_URL.into()) // test override
 }
 
-fn build_wa_view(window: &Window, acc: &Account, proxy: &EventLoopProxy<UserEvent>) -> WebView {
+fn build_wa_view(
+    window: &Window,
+    ctx: &mut WebContext,
+    acc: &Account,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> WebView {
     let (p1, p2) = (proxy.clone(), proxy.clone());
     let (id1, id2) = (acc.id.clone(), acc.id.clone());
-    WebViewBuilder::new()
-        .with_data_store_identifier(id_bytes(&acc.id))
-        .with_user_agent(UA)
+    platform::account_builder(ctx, &acc.id)
         .with_url(wa_url())
         .with_bounds(wa_bounds(window))
         .with_visible(false)
@@ -260,7 +203,7 @@ fn build_wa_view(window: &Window, acc: &Account, proxy: &EventLoopProxy<UserEven
         .with_new_window_req_handler(|url, _| {
             // External links (and "open in new tab") go to the default browser.
             if is_safe_external_url(&url) {
-                let _ = Command::new("/usr/bin/open").arg(url.trim_start()).spawn();
+                platform::open_external(url.trim_start());
             }
             NewWindowResponse::Deny
         })
@@ -283,14 +226,21 @@ const send=m=>window.ipc.postMessage(m);
 window.render=function(list){
   const l=document.getElementById('l');l.innerHTML='';
   list.forEach((a,i)=>{const d=document.createElement('div');d.className='a'+(a.active?' on':'')+(a.asleep?' z':'');
-    d.title=a.name+'  (⌘'+(i+1)+')'+(a.asleep?'  — asleep, click to open':'')+'  — right-click to rename/remove';
+    d.title=a.name+'  ('+(window.MOD||'⌘')+(i+1)+')'+(a.asleep?'  — asleep, click to open':'')+'  — right-click to rename/remove';
     d.textContent=(a.name.trim()[0]||'?').toUpperCase();
     if(a.unread>0){const b=document.createElement('span');b.className='b';b.textContent=a.unread>99?'99+':a.unread;d.appendChild(b);}
     d.onclick=()=>send('select:'+a.id);
     d.oncontextmenu=e=>{e.preventDefault();send('edit:'+a.id);};
     l.appendChild(d);});
-  const p=document.createElement('div');p.className='a add';p.textContent='+';p.title='Add account (⌘N)';
+  const p=document.createElement('div');p.className='a add';p.textContent='+';p.title='Add account ('+(window.MOD||'⌘')+'N)';
   p.onclick=()=>send('add');l.appendChild(p);
+};
+// Windows: rename/remove with the page's own dialogs (macOS uses native dialogs instead).
+window.editAccount=function(id,name){
+  const n=prompt('Account name (clear it and press OK to remove this account):',name);
+  if(n===null)return;
+  if(n.trim()===''){ if(confirm('Remove "'+name+'"? Its WhatsApp login and local data will be deleted.'))send('remove:'+id); }
+  else send('rename:'+id+':'+n.trim());
 };
 send('ready');
 </script></body></html>"#;
@@ -301,6 +251,7 @@ struct App {
     slots: Vec<Slot>,
     active: usize,
     proxy: EventLoopProxy<UserEvent>,
+    ctx: WebContext,
     sleep_item: CheckMenuItem,
     /// When the window last lost focus (None while it's in front).
     away_since: Option<Instant>,
@@ -357,7 +308,7 @@ impl App {
             if std::env::var_os("MWA_DEBUG").is_some() {
                 eprintln!("MWA_DEBUG: wake {} (active {})", self.slots[i].acc.name, self.active);
             }
-            let view = build_wa_view(&self.window, &self.slots[i].acc, &self.proxy);
+            let view = build_wa_view(&self.window, &mut self.ctx, &self.slots[i].acc, &self.proxy);
             let s = &mut self.slots[i];
             s.view = Some(view);
             s.last_reload = Instant::now();
@@ -394,15 +345,15 @@ impl App {
                     eprintln!("MWA_DEBUG: sleep {}", s.acc.name);
                 }
                 if let Some(v) = s.view.take() {
-                    close_page(&v);
+                    platform::close_page(&v);
                 }
                 s.unread = 0;
                 changed = true;
                 continue;
             }
-            let mb = footprint_mb(view);
+            let mb = platform::footprint_mb(view);
             if debug {
-                eprintln!("MWA_DEBUG: {} uses {:?} MB (pid {:?}, baseline {:?})", s.acc.name, mb, web_pid(view), s.baseline_mb);
+                eprintln!("MWA_DEBUG: {} uses {:?} MB (baseline {:?})", s.acc.name, mb, s.baseline_mb);
             }
             // The visible account is only reloaded once you've been away from the app a while.
             let idle = !active || away;
@@ -427,7 +378,7 @@ impl App {
 
     fn add(&mut self) {
         let acc = Account { id: new_id(), name: format!("Account {}", self.slots.len() + 1), sleep: false };
-        let view = build_wa_view(&self.window, &acc, &self.proxy);
+        let view = build_wa_view(&self.window, &mut self.ctx, &acc, &self.proxy);
         self.slots.push(Slot::new(acc, Some(view)));
         save_accounts(&self.slots);
         self.select(self.slots.len() - 1);
@@ -439,43 +390,17 @@ impl App {
 
     fn edit(&self, id: &str) {
         let Some(i) = self.index_of(id) else { return };
-        let name = self.slots[i].acc.name.clone();
-        let (id, proxy) = (id.to_string(), self.proxy.clone());
-        // Dialogs run in a thread so the UI stays responsive.
-        std::thread::spawn(move || {
-            let script = format!(
-                "display dialog \"Account name:\" default answer {} buttons {{\"Remove…\", \"Cancel\", \"Save\"}} default button \"Save\" cancel button \"Cancel\" with title {}",
-                as_str(&name),
-                as_str(APP_NAME)
-            );
-            let Some(out) = osascript(&script) else { return };
-            if out.starts_with("button returned:Remove") {
-                let confirm = format!(
-                    "display dialog {} buttons {{\"Cancel\", \"Remove\"}} default button \"Cancel\" cancel button \"Cancel\" with icon caution with title {}",
-                    as_str(&format!("Remove \"{name}\"? Its WhatsApp login and local data will be deleted.")),
-                    as_str(APP_NAME)
-                );
-                if osascript(&confirm).is_some() {
-                    let _ = proxy.send_event(UserEvent::Remove(id));
-                }
-            } else if let Some(t) = out.split("text returned:").nth(1) {
-                let t = t.trim();
-                if !t.is_empty() {
-                    let _ = proxy.send_event(UserEvent::Rename(id, t.to_string()));
-                }
-            }
-        });
+        platform::edit_dialog(&self.sidebar, &self.proxy, id, &self.slots[i].acc.name);
     }
 
     fn remove(&mut self, id: &str) {
         let Some(i) = self.index_of(id) else { return };
         let slot = self.slots.remove(i);
-        let bytes = id_bytes(&slot.acc.id);
         if let Some(v) = &slot.view {
-            close_page(v);
+            platform::close_page(v);
         }
-        drop(slot.view); // must drop before removing the data store
-        WebView::remove_data_store(&bytes, |_| {});
+        drop(slot.view); // must drop before removing the account's data
+        platform::remove_account_data(&data_dir(), &slot.acc.id);
         save_accounts(&self.slots);
         if self.slots.is_empty() {
             self.add();
@@ -495,33 +420,24 @@ impl App {
     }
 }
 
-fn build_menu() -> (Menu, MenuItem, MenuItem, MenuItem, CheckMenuItem, Vec<MenuItem>) {
-    let menu = Menu::new();
-    let app_m = Submenu::new(APP_NAME, true);
-    let _ = app_m.append_items(&[
-        &PredefinedMenuItem::about(None, None),
-        &PredefinedMenuItem::separator(),
-        &PredefinedMenuItem::hide(None),
-        &PredefinedMenuItem::hide_others(None),
-        &PredefinedMenuItem::show_all(None),
-        &PredefinedMenuItem::separator(),
-        &PredefinedMenuItem::quit(None),
-    ]);
-    let edit_m = Submenu::new("Edit", true);
-    let _ = edit_m.append_items(&[
-        &PredefinedMenuItem::undo(None),
-        &PredefinedMenuItem::redo(None),
-        &PredefinedMenuItem::separator(),
-        &PredefinedMenuItem::cut(None),
-        &PredefinedMenuItem::copy(None),
-        &PredefinedMenuItem::paste(None),
-        &PredefinedMenuItem::select_all(None),
-    ]);
-    let cmd = Modifiers::META;
+struct Menus {
+    bar: Menu,
+    add: MenuItem,
+    reload: MenuItem,
+    edit: MenuItem,
+    sleep: CheckMenuItem,
+    switch: Vec<MenuItem>,
+    quit: MenuItem,
+}
+
+fn build_menu() -> Menus {
+    let bar = Menu::new();
+    let cmd = platform::CMD;
     let add = MenuItem::new("New Account", true, Some(Accelerator::new(cmd, Code::KeyN)));
     let reload = MenuItem::new("Reload", true, Some(Accelerator::new(cmd, Code::KeyR)));
-    let rename = MenuItem::new("Rename / Remove…", true, None);
+    let edit = MenuItem::new("Rename / Remove…", true, None);
     let sleep = CheckMenuItem::new("Sleep When Not Used (saves memory, no notifications)", true, false, None);
+    let quit = MenuItem::new("Exit", true, None);
     let digits = [
         Code::Digit1, Code::Digit2, Code::Digit3, Code::Digit4, Code::Digit5,
         Code::Digit6, Code::Digit7, Code::Digit8, Code::Digit9,
@@ -532,18 +448,43 @@ fn build_menu() -> (Menu, MenuItem, MenuItem, MenuItem, CheckMenuItem, Vec<MenuI
         .map(|(i, c)| MenuItem::new(format!("Account {}", i + 1), true, Some(Accelerator::new(cmd, *c))))
         .collect();
     let acc_m = Submenu::new("Account", true);
-    let _ = acc_m.append_items(&[&add, &reload, &rename, &sleep, &PredefinedMenuItem::separator()]);
+    let _ = acc_m.append_items(&[&add, &reload, &edit, &sleep, &PredefinedMenuItem::separator()]);
     for s in &switch {
         let _ = acc_m.append(s);
     }
-    let win_m = Submenu::new("Window", true);
-    let _ = win_m.append_items(&[
-        &PredefinedMenuItem::minimize(None),
-        &PredefinedMenuItem::fullscreen(None),
-        &PredefinedMenuItem::close_window(None),
-    ]);
-    let _ = menu.append_items(&[&app_m, &edit_m, &acc_m, &win_m]);
-    (menu, add, reload, rename, sleep, switch)
+    if cfg!(target_os = "macos") {
+        let app_m = Submenu::new(APP_NAME, true);
+        let _ = app_m.append_items(&[
+            &PredefinedMenuItem::about(None, None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::hide(None),
+            &PredefinedMenuItem::hide_others(None),
+            &PredefinedMenuItem::show_all(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::quit(None),
+        ]);
+        let edit_m = Submenu::new("Edit", true);
+        let _ = edit_m.append_items(&[
+            &PredefinedMenuItem::undo(None),
+            &PredefinedMenuItem::redo(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::cut(None),
+            &PredefinedMenuItem::copy(None),
+            &PredefinedMenuItem::paste(None),
+            &PredefinedMenuItem::select_all(None),
+        ]);
+        let win_m = Submenu::new("Window", true);
+        let _ = win_m.append_items(&[
+            &PredefinedMenuItem::minimize(None),
+            &PredefinedMenuItem::fullscreen(None),
+            &PredefinedMenuItem::close_window(None),
+        ]);
+        let _ = bar.append_items(&[&app_m, &edit_m, &acc_m, &win_m]);
+    } else {
+        let _ = acc_m.append_items(&[&PredefinedMenuItem::separator(), &quit]);
+        let _ = bar.append(&acc_m);
+    }
+    Menus { bar, add, reload, edit, sleep, switch, quit }
 }
 
 fn main() {
@@ -555,15 +496,23 @@ fn main() {
         .open(data_dir().join("app.lock"))
         .expect("cannot open lock file");
     if lock.try_lock().is_err() {
-        osascript(&format!("display alert {} message \"Close the other copy first. Running two copies at once can log you out of WhatsApp.\"", as_str(&format!("{APP_NAME} is already running."))));
+        platform::alert(
+            &format!("{APP_NAME} is already running."),
+            "Close the other copy first. Running two copies at once can log you out of WhatsApp.",
+        );
         return;
     }
+    if let Err(msg) = platform::check_runtime() {
+        platform::alert(APP_NAME, &msg);
+        return;
+    }
+    platform::before_start(&data_dir());
 
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    let menus = build_menu();
+    let mut builder = EventLoopBuilder::<UserEvent>::with_user_event();
+    platform::hook_menu_keys(&mut builder, &menus.bar);
+    let event_loop = builder.build();
     let proxy = event_loop.create_proxy();
-
-    let (menu, m_add, m_reload, m_edit, m_sleep, m_switch) = build_menu();
-    menu.init_for_nsapp();
     {
         let p = proxy.clone();
         MenuEvent::set_event_handler(Some(move |e| {
@@ -571,15 +520,17 @@ fn main() {
         }));
     }
 
-    let window = WindowBuilder::new()
+    let window = platform::window_extras(WindowBuilder::new())
         .with_title(APP_NAME)
         .with_inner_size(LogicalSize::new(1200.0, 820.0))
         .with_min_inner_size(LogicalSize::new(600.0, 400.0))
         .build(&event_loop)
         .expect("failed to create window");
+    platform::attach_menu(&menus.bar, &window);
 
     let sp = proxy.clone();
     let sidebar = WebViewBuilder::new()
+        .with_initialization_script(platform::SIDEBAR_INIT)
         .with_html(SIDEBAR_HTML)
         .with_bounds(sidebar_bounds(&window))
         .with_ipc_handler(move |req| {
@@ -588,13 +539,10 @@ fn main() {
         .build_as_child(&window)
         .expect("failed to create sidebar");
 
-    // The sidebar build registered wry's delegate class; hook the WebCrypto master key
-    // before any WhatsApp webview exists (see webcrypto.rs).
-    if std::env::var_os("MWA_NO_HOOK").is_some() {
-        // test override: behave like the old build (Keychain-backed master key)
-    } else if !webcrypto::install(webcrypto::load_or_create(&data_dir())) {
-        eprintln!("warning: could not install WebCrypto master key hook; falling back to Keychain");
-    }
+    // macOS: the sidebar build registered wry's delegate class; the WebCrypto master key hook
+    // must be installed now, before any WhatsApp webview exists (see webcrypto.rs).
+    platform::after_sidebar(&data_dir());
+    let mut ctx = platform::web_context(&data_dir());
 
     let mut accounts = load_accounts();
     if accounts.is_empty() {
@@ -605,7 +553,7 @@ fn main() {
         .into_iter()
         .enumerate()
         .map(|(i, acc)| {
-            let view = (i == 0 || !acc.sleep).then(|| build_wa_view(&window, &acc, &proxy));
+            let view = (i == 0 || !acc.sleep).then(|| build_wa_view(&window, &mut ctx, &acc, &proxy));
             Slot::new(acc, view)
         })
         .collect();
@@ -621,7 +569,8 @@ fn main() {
         });
     }
 
-    let mut app = App { window, sidebar, slots, active: 0, proxy, sleep_item: m_sleep.clone(), away_since: None };
+    let Menus { bar: _bar, add: m_add, reload: m_reload, edit: m_edit, sleep: m_sleep, switch: m_switch, quit: m_quit } = menus;
+    let mut app = App { window, sidebar, slots, active: 0, proxy, ctx, sleep_item: m_sleep.clone(), away_since: None };
     save_accounts(&app.slots);
     let start = env_num("MWA_START").unwrap_or(0) as usize;
     app.select(if start < app.slots.len() { start } else { 0 });
@@ -649,10 +598,18 @@ fn main() {
                         }
                     } else if let Some(id) = msg.strip_prefix("edit:") {
                         app.edit(id);
+                    } else if let Some(rest) = msg.strip_prefix("rename:") {
+                        if let Some((id, name)) = rest.split_once(':') {
+                            let _ = app.proxy.send_event(UserEvent::Rename(id.into(), name.into()));
+                        }
+                    } else if let Some(id) = msg.strip_prefix("remove:") {
+                        app.remove(id);
                     }
                 }
                 UserEvent::Menu(e) => {
-                    if e.id == *m_add.id() {
+                    if e.id == *m_quit.id() {
+                        *control_flow = ControlFlow::Exit;
+                    } else if e.id == *m_add.id() {
                         app.add();
                     } else if e.id == *m_reload.id() {
                         if let Some(s) = app.slots.get_mut(app.active) {
@@ -694,18 +651,11 @@ fn main() {
                     if i == app.active && app.window.is_focused() {
                         return;
                     }
-                    let script = format!(
-                        "display notification {} with title {} subtitle {}",
-                        as_str(&body),
-                        as_str(&app.slots[i].acc.name),
-                        as_str(&title)
-                    );
-                    std::thread::spawn(move || {
-                        osascript(&script);
-                    });
+                    platform::notify(&app.slots[i].acc.name, &title, &body);
                 }
                 UserEvent::Rename(id, name) => {
                     if let Some(i) = app.index_of(&id) {
+                        let name: String = name.chars().take(60).collect();
                         app.slots[i].acc.name = name;
                         save_accounts(&app.slots);
                         app.refresh_sidebar();

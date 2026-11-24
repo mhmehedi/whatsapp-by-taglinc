@@ -1,0 +1,60 @@
+# Builds the Windows installer and attaches it to the GitHub release.
+# Runs when a release is published, or by hand (Actions → Windows → Run workflow) for an existing tag.
+name: Windows
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and upload to its release (e.g. v0.1.4), or a branch to only build"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Build
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+          cargo +stable build --release --target x86_64-pc-windows-msvc
+          Get-Item target\x86_64-pc-windows-msvc\release\multi-whatsapp.exe | Select-Object Name, Length
+
+      - name: Test
+        shell: pwsh
+        run: cargo +stable test --release --target x86_64-pc-windows-msvc
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          & $iscc "/DAppVersion=$version" installer\windows.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item dist\Whatsapp-by-TagLinc-Setup.exe | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Whatsapp-by-TagLinc-Setup
+          path: dist/Whatsapp-by-TagLinc-Setup.exe
+
+      - name: Upload to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Host "No release named $env:TAG; skipping upload."; exit 0 }
+          gh release upload $env:TAG dist\Whatsapp-by-TagLinc-Setup.exe --clobber
