@@ -41,6 +41,7 @@ jobs:
           $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (-not (Test-Path $nsis)) { choco install nsis -y --no-progress; }
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force dist | Out-Null
           & $nsis "/DAPP_VERSION=$version" installer\windows.nsi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-Item dist\Whatsapp-by-TagLinc-Setup.exe | Select-Object Name, Length
