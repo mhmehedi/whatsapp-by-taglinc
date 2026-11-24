@@ -1,0 +1,31 @@
+Whatsapp by TagLinc — How to install
+=====================================
+
+Needs: macOS 14 (Sonoma) or newer. Works on both Apple Silicon and Intel Macs.
+
+1. Drag "Whatsapp by TagLinc" onto the "Applications" folder in this window.
+
+2. Open Whatsapp by TagLinc from Applications.
+   macOS will say it "can't be opened" or "could not verify" it,
+   because the app is not from the App Store. Click "Done" / "OK".
+
+3. Open System Settings -> Privacy & Security.
+   Scroll down. Next to "Whatsapp by TagLinc was blocked", click "Open Anyway",
+   then confirm with your Mac password or Touch ID.
+   (You only need to do this once.)
+
+   Alternative: open Terminal and run
+     xattr -dr com.apple.quarantine "/Applications/Whatsapp by TagLinc.app"
+
+4. Scan the QR code with WhatsApp on your phone
+   (Settings -> Linked devices -> Link a device).
+
+Using it
+--------
+  +            add another WhatsApp account (or Cmd+N)
+  Cmd+1 ... 9  switch between accounts
+  Right-click  an account to rename or remove it
+  Cmd+R        reload the current account
+
+Run only one copy of the app at a time, from Applications -
+not from inside the DMG.
